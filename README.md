@@ -1,0 +1,70 @@
+# parallel-task-scheduler-go
+
+本地多工人并发任务调度与中断恢复引擎。保证任务依赖、资源竞争与进程重启下的执行结果**始终一致且可解释**。
+
+## 调度模型
+
+- 任务以 `Task{ID, DependsOn, Resources, Fn}` 声明，通过 `Submit` 注册、`Run` 统一调度。
+- **单一调度循环**独占所有状态迁移，工人 goroutine 只执行用户函数并通过 channel 汇报结果，因此状态迁移无数据竞争，可在 `-race` 下验证。
+- 任务只有在全部依赖**成功**后才进入就绪集；就绪任务按有界并发额度（`Config.Workers`）准入执行。
+
+### 依赖声明的静态校验（原因可区分）
+
+| 情形 | 错误 | 拒绝时机 |
+|---|---|---|
+| 重复任务声明 | `ErrDuplicateTask` | Submit |
+| 重复依赖声明 | `ErrDuplicateDependency` | Submit |
+| 自依赖 | `ErrSelfDependency` | Submit |
+| 依赖缺失 | `ErrMissingDependency` | Run（依赖可能后注册，统一校验） |
+| 依赖成环 | `ErrCyclicDependency` | Run（三色标记 DFS） |
+
+依赖失败/取消/超时时，后继任务被标记为 **`StatusSkipped`（可区分终态）并级联传播**，绝不会被静默标记为完成，其函数体也绝不会执行。
+
+### 任务状态机
+
+```
+pending → ready → running → succeeded | failed | timed_out | canceled
+                依赖未成功终止 → skipped（级联）
+```
+
+终态：`succeeded / failed / canceled / timed_out / skipped`，彼此可区分（`Status.Terminal()`）。
+
+## 资源模型与背压
+
+- `Config.Workers` 为全局并发额度；`Config.Capacity` 声明命名资源总量（如 `{"gpu": 1}`），任务以 `Resources` 声明占用需求。
+- 准入是**阻塞等待**而非丢弃：额度或资源不足时任务在调度队列/准入点等待，释放后立即唤醒重检（通知 channel + 节拍兜底，无丢失唤醒）。
+- 在途任务数 ≤ Workers，等待准入的工人不持有任何资源，持有资源者必在推进，因此**无死锁、协程数有界、不会无界堆积**。
+- 任务结束（无论何种终态）即释放全部已占用资源；等待准入期间被取消的任务从未占用资源，无需释放。
+
+## 取消与超时语义
+
+- 取消 `Run` 的 ctx 即向所有在途任务传播取消，调度循环等待在途任务回收后，将剩余未终态任务统一标记为 `canceled`。
+- `Config.TaskTimeout` 为单次尝试超时；**取消与超时严格区分**：父 ctx 结束 → `canceled`；仅尝试 ctx 超时 → `timed_out`。
+- 重试退避等待同样可被取消打断。
+
+## 重试规则
+
+- `RetryPolicy{MaxAttempts, BaseBackoff, MaxBackoff}`：总尝试上限（含首次），指数退避并封顶。
+- 仅对失败重试；取消立即终止不重试。最终状态反映最后一次尝试的性质（`failed` 或 `timed_out`）。
+- 每次状态迁移（ready/running/终态）都先落盘再生效，**已成功的任务绝不重复提交**，不会产生重复副作用。
+
+## 中断恢复
+
+- `Config.JournalPath` 指向追加式 JSONL 进度日志，每条记录 `{id, status, attempts, updated_at}` 写入后 fsync。
+- 重启后以同一日志恢复：
+  - **终态任务**：不重复执行，直接按记录回放终态并走同一套依赖传播逻辑（保证恢复后状态自洽，包括失败依赖的级联跳过）；
+  - **在途任务**（崩溃时非终态）：保留已持久化的尝试计数，重新进入调度，统计不丢失。
+- 恢复回放与正常执行共用同一状态机，并发访问下恢复后的状态仍自洽（由 `-race` 高并发测试验证）。
+
+## 验证方法
+
+```bash
+go test ./... -race -count=1 -v
+```
+
+测试覆盖（单测日志均打印调度输入与判定依据，格式为 `input: ... / verdict: ...`）：
+
+- `dag_test.go`：成环、缺失、重复任务、重复依赖、自依赖的拒绝原因；
+- `scheduler_test.go`：依赖顺序与失败级联跳过、重试上限与退避、取消传播与资源释放、超时与取消的区分、资源背压（gpu 并发持有者 ≤ 容量）；
+- `recovery_test.go`：崩溃现场恢复（已完成不重复、在途统计保留、失败依赖级联跳过、并发恢复自洽）；
+- `concurrency_test.go`：100 任务分层全连接 DAG 在 `-race` 下结果确定、每个任务恰好执行一次、Run 返回后无协程泄漏；提交与取消交叉 10 轮无死锁。
