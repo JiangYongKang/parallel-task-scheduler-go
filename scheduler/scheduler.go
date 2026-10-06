@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -18,6 +19,9 @@ type Config struct {
 	Retry RetryPolicy
 	// TaskTimeout 为单任务单次尝试的超时，0 表示不限制。
 	TaskTimeout time.Duration
+	// Groups 为各业务分组的额度（并发数与命名资源上限）。
+	// 全局 Workers/Capacity 仍是最外层硬约束，分组额度只能在其内收紧。
+	Groups map[string]GroupQuota
 	// JournalPath 为进度日志路径，空串表示纯内存（不恢复）。
 	JournalPath string
 	// Logf 为可选判定日志，测试用它打印调度输入与判定依据。
@@ -32,6 +36,7 @@ type Config struct {
 type Scheduler struct {
 	cfg Config
 	rm  *resourceManager
+	gl  *groupLimiter
 	j   *journal
 	d   *dag
 
@@ -47,6 +52,7 @@ type taskState struct {
 	remaining int  // 尚未成功终止的依赖数
 	depFailed bool // 存在未成功终止的依赖
 	enqueued  bool // 已进入就绪队列，防止重复入队
+	admitted  bool // 已准入（占用分组额度），终态时需归还
 }
 
 // result 是工人汇报的一次任务终态。
@@ -63,6 +69,7 @@ func New(cfg Config) (*Scheduler, error) {
 	if err != nil {
 		return nil, err
 	}
+	j.logf = cfg.Logf
 	workers := cfg.Workers
 	if workers <= 0 {
 		workers = 1
@@ -71,6 +78,7 @@ func New(cfg Config) (*Scheduler, error) {
 	return &Scheduler{
 		cfg: cfg,
 		rm:  newResourceManager(workers, cfg.Capacity),
+		gl:  newGroupLimiter(cfg.Groups),
 		j:   j,
 		d:   newDAG(),
 	}, nil
@@ -83,6 +91,8 @@ func (s *Scheduler) logf(format string, args ...any) {
 }
 
 // Submit 注册任务。重复声明、自依赖、重复依赖在此被拒绝；
+// 资源声明不合理（未知资源/超容量/非法申请量）也在此被拒绝，
+// 避免永远不可准入的任务进入调度、无限等待拖住整批任务；
 // 缺失依赖与成环在 Run 时统一校验（因为依赖可能后注册）。
 func (s *Scheduler) Submit(t *Task) error {
 	s.mu.Lock()
@@ -90,11 +100,15 @@ func (s *Scheduler) Submit(t *Task) error {
 	if s.closed {
 		return ErrSchedulerClosed
 	}
+	if err := s.gl.validate(t, s.cfg.Capacity); err != nil {
+		s.logf("submit rejected: task=%q reason=%v", t.ID, err)
+		return err
+	}
 	if err := s.d.add(t); err != nil {
 		s.logf("submit rejected: task=%q reason=%v", t.ID, err)
 		return err
 	}
-	s.logf("submit accepted: task=%q deps=%v resources=%v", t.ID, t.DependsOn, t.Resources)
+	s.logf("submit accepted: task=%q group=%q deps=%v resources=%v", t.ID, t.Group, t.DependsOn, t.Resources)
 	return nil
 }
 
@@ -146,6 +160,10 @@ func (s *Scheduler) Run(ctx context.Context) (map[string]Record, error) {
 		st.status = status
 		st.attempts = attempts
 		done++
+		if st.admitted {
+			st.admitted = false
+			s.gl.release(st.t)
+		}
 		s.j.append(id, status, attempts)
 		s.logf("terminal: task=%q status=%s attempts=%d done=%d/%d", id, status, attempts, done, total)
 		for _, next := range dependents[id] {
@@ -171,8 +189,10 @@ func (s *Scheduler) Run(ctx context.Context) (map[string]Record, error) {
 	admit := func(id string) {
 		st := states[id]
 		st.status = StatusReady
+		st.admitted = true
+		s.gl.admit(st.t)
 		inflight++
-		s.logf("admit: task=%q inflight=%d/%d recovered_attempts=%d", id, inflight, s.cfg.Workers, st.attempts)
+		s.logf("admit: task=%q group=%q inflight=%d/%d recovered_attempts=%d", id, st.t.Group, inflight, s.cfg.Workers, st.attempts)
 		s.j.append(id, StatusReady, st.attempts)
 		go s.runTask(runCtx, st, resultsCh)
 	}
@@ -194,19 +214,36 @@ func (s *Scheduler) Run(ctx context.Context) (map[string]Record, error) {
 		}
 	}
 	// 初始就绪集：无未决依赖且未被跳过、尚未入队的任务。
+	// 按任务 ID 排序入队，保证调度顺序确定、结果可复现。
+	var initial []string
 	for id, st := range states {
 		if !st.status.Terminal() && st.remaining == 0 && !st.depFailed && !st.enqueued {
 			st.enqueued = true
-			ready = append(ready, id)
+			initial = append(initial, id)
 		}
 	}
+	sort.Strings(initial)
+	ready = append(ready, initial...)
 
 	canceled := false
 	for done < total {
-		// 背压：仅当准入名额未满时才放行就绪任务，否则等待。
-		for !canceled && inflight < s.cfg.Workers && len(ready) > 0 {
-			id := ready[0]
-			ready = ready[1:]
+		// 背压：仅当全局准入名额未满时才放行就绪任务，否则等待。
+		// 分组公平：按入队顺序扫描，跳过额度已用满的分组（其任务继续排队，
+		// 不丢弃、不阻塞其他分组），放行第一个满足分组额度的任务；
+		// 任务集有限，被跳过的分组额度释放后必然被扫描到，不会饿死。
+		for !canceled && inflight < s.cfg.Workers {
+			idx := -1
+			for i, id := range ready {
+				if s.gl.canAdmit(states[id].t) {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				break
+			}
+			id := ready[idx]
+			ready = append(ready[:idx], ready[idx+1:]...)
 			admit(id)
 		}
 		if done >= total {

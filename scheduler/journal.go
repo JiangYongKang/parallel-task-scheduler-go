@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -18,6 +19,7 @@ type journal struct {
 	path string
 	f    *os.File
 	enc  *json.Encoder
+	logf func(format string, args ...any)
 }
 
 // openJournal 打开（不存在则创建）日志文件。
@@ -51,12 +53,15 @@ func (j *journal) append(id string, st Status, attempts int) error {
 }
 
 // load 读取日志，返回每个任务的最新记录（后写覆盖先写）。
+// 容忍撕裂写：进程在写进度中途被强杀会留下不完整的尾部记录，
+// 此时截断到最后一条完整记录、用已恢复的进度继续，
+// 不让整次恢复因尾部残缺而失败。
 func (j *journal) load() (map[string]Record, error) {
 	out := make(map[string]Record)
 	if j.path == "" {
 		return out, nil
 	}
-	f, err := os.Open(j.path)
+	f, err := os.OpenFile(j.path, os.O_RDWR, 0o644)
 	if errors.Is(err, os.ErrNotExist) {
 		return out, nil
 	}
@@ -64,19 +69,37 @@ func (j *journal) load() (map[string]Record, error) {
 		return nil, err
 	}
 	defer f.Close()
-	dec := json.NewDecoder(bufio.NewReader(f))
+	r := bufio.NewReader(f)
+	var good int64 // 已确认完整的字节偏移
 	for {
-		var rec Record
-		err := dec.Decode(&rec)
-		if errors.Is(err, io.EOF) {
-			break
+		line, rerr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			var rec Record
+			if jerr := json.Unmarshal(line, &rec); jerr != nil {
+				j.log("journal: torn tail at offset %d (%d bytes), truncate and recover from last good record: %v",
+					good, len(line), jerr)
+				if terr := f.Truncate(good); terr != nil {
+					return nil, fmt.Errorf("truncate torn journal: %w", terr)
+				}
+				break
+			}
+			out[rec.ID] = rec
+			good += int64(len(line))
 		}
-		if err != nil {
-			return nil, err
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			return nil, rerr
 		}
-		out[rec.ID] = rec
 	}
 	return out, nil
+}
+
+func (j *journal) log(format string, args ...any) {
+	if j.logf != nil {
+		j.logf(format, args...)
+	}
 }
 
 func (j *journal) close() error {

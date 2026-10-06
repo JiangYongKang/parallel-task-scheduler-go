@@ -41,6 +41,17 @@ var (
 	ErrQueueFull           = errors.New("scheduler: admission queue full")
 )
 
+// 可区分的资源声明错误（与依赖类错误完全分开）。
+var (
+	// ErrUnknownResource 表示任务引用了系统里未配置的资源。
+	ErrUnknownResource = errors.New("scheduler: unknown resource")
+	// ErrResourceExceedsCapacity 表示单个任务申请量超过配置的总容量
+	// （或超过其分组额度上限），该任务永远不可能被准入。
+	ErrResourceExceedsCapacity = errors.New("scheduler: resource request exceeds capacity")
+	// ErrInvalidResourceRequest 表示资源申请量非法（负数）。
+	ErrInvalidResourceRequest = errors.New("scheduler: invalid resource request")
+)
+
 // TaskFunc 是任务体。ctx 取消或超时必须向下游传播。
 type TaskFunc func(ctx context.Context) error
 
@@ -48,8 +59,19 @@ type TaskFunc func(ctx context.Context) error
 type Task struct {
 	ID        string
 	DependsOn []string
+	// Group 为业务分组名，空串表示不归属任何分组（仅受全局约束）。
+	Group     string
 	Resources map[string]int64 // 资源占用需求
 	Fn        TaskFunc
+}
+
+// GroupQuota 为单个业务分组的额度，只能在全局上限范围内收紧。
+// 零值字段表示该维度不设分组级限制（仅受全局约束）。
+type GroupQuota struct {
+	// Workers 为该分组同时运行的任务数上限，<=0 表示不限制。
+	Workers int
+	// Capacity 为该分组可占用的命名资源上限（须不大于全局容量才有意义）。
+	Capacity map[string]int64
 }
 
 // RetryPolicy 描述有限次数与退避策略。

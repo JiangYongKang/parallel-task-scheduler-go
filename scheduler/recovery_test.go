@@ -131,3 +131,78 @@ func TestJournalFileActuallyPersisted(t *testing.T) {
 		t.Fatalf("journal not persisted: %v size=%d", err, fi.Size())
 	}
 }
+
+func TestRecoveryToleratesTornJournal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "progress.jsonl")
+	writeJournal(t, path, []Record{
+		{ID: "a", Status: StatusSucceeded, Attempts: 1},
+		{ID: "b", Status: StatusRunning, Attempts: 2},
+	})
+	// 模拟写进度中途被强杀：尾部留下半条不完整的记录。
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"id":"b","sta`); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	t.Logf("input: journal has a=succeeded(1), b=running(2), then a torn half-written tail")
+
+	var aCalls, bCalls atomic.Int32
+	s, _ := New(Config{Workers: 2, JournalPath: path, Logf: testLogger(t)})
+	s.Submit(&Task{ID: "a", Fn: func(context.Context) error { aCalls.Add(1); return nil }})
+	s.Submit(&Task{ID: "b", DependsOn: []string{"a"}, Fn: func(context.Context) error { bCalls.Add(1); return nil }})
+	out, err := s.Run(context.Background())
+	if err != nil {
+		t.Fatalf("torn journal must not fail recovery: %v", err)
+	}
+	t.Logf("verdict: a=%s(%d,calls=%d) b=%s(%d,calls=%d)",
+		out["a"].Status, out["a"].Attempts, aCalls.Load(),
+		out["b"].Status, out["b"].Attempts, bCalls.Load())
+	if aCalls.Load() != 0 {
+		t.Fatalf("completed task re-executed: calls=%d", aCalls.Load())
+	}
+	if bCalls.Load() != 1 || out["b"].Status != StatusSucceeded || out["b"].Attempts != 3 {
+		t.Fatalf("resumed b = %s/%d calls=%d, want succeeded/3 calls=1", out["b"].Status, out["b"].Attempts, bCalls.Load())
+	}
+
+	// 撕裂尾部已被截断：恢复后整个日志重新可解析，且含本次新写入的记录。
+	j, err := openJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs, err := j.load()
+	if err != nil {
+		t.Fatalf("journal after truncation must be fully parseable: %v", err)
+	}
+	if recs["b"].Status != StatusSucceeded || recs["b"].Attempts != 3 {
+		t.Fatalf("reloaded b = %s/%d, want succeeded/3", recs["b"].Status, recs["b"].Attempts)
+	}
+	t.Logf("verdict: journal re-parseable after recovery, b=%s(%d)", recs["b"].Status, recs["b"].Attempts)
+}
+
+func TestRecoveryKilledAfterAdmissionBeforeExecution(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "progress.jsonl")
+	// 崩溃现场：b 已准入（拿到资源、状态落盘为 ready）但尚未真正开始执行。
+	writeJournal(t, path, []Record{
+		{ID: "b", Status: StatusReady, Attempts: 1},
+	})
+	t.Logf("input: journal has b=ready(1) at crash (admitted, never executed)")
+
+	var bCalls atomic.Int32
+	s, _ := New(Config{Workers: 1, JournalPath: path, Logf: testLogger(t)})
+	s.Submit(&Task{ID: "b", Fn: func(context.Context) error { bCalls.Add(1); return nil }})
+	out, err := s.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("verdict: b=%s attempts=%d calls=%d", out["b"].Status, out["b"].Attempts, bCalls.Load())
+	if bCalls.Load() != 1 {
+		t.Fatalf("b must execute exactly once after recovery, got %d", bCalls.Load())
+	}
+	// 在途进度（已累计尝试数）不丢：崩溃前 1 次 + 恢复后 1 次 = 2。
+	if out["b"].Status != StatusSucceeded || out["b"].Attempts != 2 {
+		t.Fatalf("b = %s/%d, want succeeded/2", out["b"].Status, out["b"].Attempts)
+	}
+}
