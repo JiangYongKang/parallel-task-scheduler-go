@@ -18,6 +18,7 @@ type journal struct {
 	path string
 	f    *os.File
 	enc  *json.Encoder
+	logf func(format string, args ...any) // 可选，恢复时报告不完整尾部
 }
 
 // openJournal 打开（不存在则创建）日志文件。
@@ -51,6 +52,11 @@ func (j *journal) append(id string, st Status, attempts int) error {
 }
 
 // load 读取日志，返回每个任务的最新记录（后写覆盖先写）。
+//
+// 崩溃兼容：进程可能在写记录的中途被强杀，文件尾部因此留下不完整
+// （截断/半行）的数据。追加式日志一旦解码失败就无法重新同步，
+// 此时丢弃不完整的尾部、用已成功解码的前缀记录恢复，
+// 不让整次恢复因此失败。空 ID 的残缺记录同样跳过。
 func (j *journal) load() (map[string]Record, error) {
 	out := make(map[string]Record)
 	if j.path == "" {
@@ -72,7 +78,16 @@ func (j *journal) load() (map[string]Record, error) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			if j.logf != nil {
+				j.logf("journal: dropping incomplete tail after crash mid-write: %v", err)
+			}
+			break
+		}
+		if rec.ID == "" {
+			if j.logf != nil {
+				j.logf("journal: skipping record with empty id")
+			}
+			continue
 		}
 		out[rec.ID] = rec
 	}

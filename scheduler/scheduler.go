@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -14,6 +15,8 @@ type Config struct {
 	Workers int
 	// Capacity 为命名资源总量，如 {"gpu": 1}。
 	Capacity map[string]int64
+	// Groups 为业务分组额度（并发数与命名资源），仅在全局上限内收紧。
+	Groups map[string]GroupQuota
 	// Retry 为失败重试策略。
 	Retry RetryPolicy
 	// TaskTimeout 为单任务单次尝试的超时，0 表示不限制。
@@ -63,6 +66,7 @@ func New(cfg Config) (*Scheduler, error) {
 	if err != nil {
 		return nil, err
 	}
+	j.logf = cfg.Logf
 	workers := cfg.Workers
 	if workers <= 0 {
 		workers = 1
@@ -89,6 +93,10 @@ func (s *Scheduler) Submit(t *Task) error {
 	defer s.mu.Unlock()
 	if s.closed {
 		return ErrSchedulerClosed
+	}
+	if err := validateResources(s.cfg, t); err != nil {
+		s.logf("submit rejected: task=%q reason=%v", t.ID, err)
+		return err
 	}
 	if err := s.d.add(t); err != nil {
 		s.logf("submit rejected: task=%q reason=%v", t.ID, err)
@@ -129,6 +137,12 @@ func (s *Scheduler) Run(ctx context.Context) (map[string]Record, error) {
 			dependents[dep] = append(dependents[dep], id)
 		}
 	}
+	// 排序下游列表，保证调度顺序确定、结果可复现。
+	for dep := range dependents {
+		sort.Strings(dependents[dep])
+	}
+	// 分组额度限制器：仅在全局上限内收紧，准入/回收都由本循环独占。
+	gl := newGroupLimiter(s.cfg.Groups)
 
 	resultsCh := make(chan result, s.cfg.Workers)
 	runCtx, cancelAll := context.WithCancel(ctx)
@@ -172,7 +186,8 @@ func (s *Scheduler) Run(ctx context.Context) (map[string]Record, error) {
 		st := states[id]
 		st.status = StatusReady
 		inflight++
-		s.logf("admit: task=%q inflight=%d/%d recovered_attempts=%d", id, inflight, s.cfg.Workers, st.attempts)
+		gl.acquire(st.t.Group, st.t.Resources)
+		s.logf("admit: task=%q group=%q inflight=%d/%d recovered_attempts=%d", id, st.t.Group, inflight, s.cfg.Workers, st.attempts)
 		s.j.append(id, StatusReady, st.attempts)
 		go s.runTask(runCtx, st, resultsCh)
 	}
@@ -194,19 +209,37 @@ func (s *Scheduler) Run(ctx context.Context) (map[string]Record, error) {
 		}
 	}
 	// 初始就绪集：无未决依赖且未被跳过、尚未入队的任务。
+	// 排序后入队，保证就绪顺序确定、结果可复现。
+	var initial []string
 	for id, st := range states {
 		if !st.status.Terminal() && st.remaining == 0 && !st.depFailed && !st.enqueued {
 			st.enqueued = true
-			ready = append(ready, id)
+			initial = append(initial, id)
 		}
 	}
+	sort.Strings(initial)
+	ready = append(ready, initial...)
 
 	canceled := false
 	for done < total {
-		// 背压：仅当准入名额未满时才放行就绪任务，否则等待。
-		for !canceled && inflight < s.cfg.Workers && len(ready) > 0 {
-			id := ready[0]
-			ready = ready[1:]
+		// 背压 + 分组公平：仅当全局准入名额未满时，按就绪顺序扫描，
+		// 准入第一个分组额度未用满的任务；额度用满的分组任务留在队列中等待，
+		// 不丢弃、也不阻塞其他分组的任务。每次事件后重新扫描，
+		// 任一有空余额度的分组都能获得执行机会，不会长期饿死。
+		for !canceled && inflight < s.cfg.Workers {
+			idx := -1
+			for i, id := range ready {
+				st := states[id]
+				if gl.admit(st.t.Group, st.t.Resources) {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				break
+			}
+			id := ready[idx]
+			ready = append(ready[:idx], ready[idx+1:]...)
 			admit(id)
 		}
 		if done >= total {
@@ -224,6 +257,7 @@ func (s *Scheduler) Run(ctx context.Context) (map[string]Record, error) {
 		select {
 		case res := <-resultsCh:
 			inflight--
+			gl.release(states[res.id].t.Group, states[res.id].t.Resources)
 			finish(res.id, res.status, res.attempts)
 		case <-ctx.Done():
 			if !canceled {

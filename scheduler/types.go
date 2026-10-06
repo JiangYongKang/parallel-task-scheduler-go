@@ -41,12 +41,24 @@ var (
 	ErrQueueFull           = errors.New("scheduler: admission queue full")
 )
 
+// 可区分的资源声明错误（与依赖类错误完全分开）。
+var (
+	// ErrUnknownResource 表示任务引用了系统未配置的命名资源。
+	ErrUnknownResource = errors.New("scheduler: unknown resource")
+	// ErrResourceExceedsCapacity 表示单个任务的资源申请超过配置总容量
+	// （全局容量或其所属分组额度），永远不可能被满足。
+	ErrResourceExceedsCapacity = errors.New("scheduler: resource request exceeds capacity")
+	// ErrInvalidResourceAmount 表示资源申请量非法（负数）。
+	ErrInvalidResourceAmount = errors.New("scheduler: invalid resource amount")
+)
+
 // TaskFunc 是任务体。ctx 取消或超时必须向下游传播。
 type TaskFunc func(ctx context.Context) error
 
 // Task 描述一个待调度任务。
 type Task struct {
 	ID        string
+	Group     string // 业务分组，空串表示不属于任何分组（仅受全局约束）
 	DependsOn []string
 	Resources map[string]int64 // 资源占用需求
 	Fn        TaskFunc
